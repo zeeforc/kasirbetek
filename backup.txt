@@ -1,0 +1,248 @@
+<?php
+// STEP 1: Buat direktori jika belum ada
+$dirs = [
+    'app/Helpers',
+    'app/Filament/Resources/StockReportResource/Pages'
+];
+
+foreach ($dirs as $dir) {
+    if (!is_dir($dir)) {
+        mkdir($dir, 0755, true);
+        echo "✓ Created directory: $dir\n";
+    }
+}
+
+// STEP 2: Buat file Model StockReport
+file_put_contents(
+    'app/Models/StockReport.php',
+    <<<'EOL'
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+
+class StockReport extends Model
+{
+    use HasFactory;
+
+    protected $fillable = [
+        'name',
+        'report_date',
+        'total_items',
+        'total_cost_value',
+        'total_selling_value',
+        'path_file',
+    ];
+
+    protected $casts = [
+        'report_date' => 'date',
+        'total_items' => 'integer',
+        'total_cost_value' => 'integer',
+        'total_selling_value' => 'integer',
+    ];
+}
+EOL
+);
+echo "✓ Created StockReport.php\n";
+
+// STEP 3: Buat file Service StockReportService
+file_put_contents(
+    'app/Services/StockReportService.php',
+    <<<'EOL'
+<?php
+
+namespace App\Services;
+
+use App\Models\Product;
+use Illuminate\Support\Collection;
+
+class StockReportService
+{
+    public function getStockData(?string $reportDate = null): Collection
+    {
+        $products = Product::query()
+            ->where('is_active', true)
+            ->select('id', 'name', 'stock', 'cost_price', 'price')
+            ->orderBy('name', 'asc')
+            ->get();
+
+        return $products->map(function (Product $product) {
+            $stock = $product->stock ?? 0;
+            $costPrice = $product->cost_price ?? 0;
+            $sellingPrice = $product->price ?? 0;
+
+            return [
+                'name' => $product->name,
+                'stock' => $stock,
+                'cost_price' => $costPrice,
+                'selling_price' => $sellingPrice,
+                'total_cost_value' => $stock * $costPrice,
+                'total_selling_value' => $stock * $sellingPrice,
+            ];
+        });
+    }
+
+    public function calculateTotals(Collection $stockData): array
+    {
+        $totalItems = $stockData->count();
+        $totalCostValue = $stockData->sum('total_cost_value');
+        $totalSellingValue = $stockData->sum('total_selling_value');
+
+        return compact('totalItems', 'totalCostValue', 'totalSellingValue');
+    }
+
+    public function formatForExport(Collection $stockData, array $totals): array
+    {
+        $formatted = $stockData->map(function (array $item) {
+            return [
+                'Nama Produk' => $item['name'],
+                'Sisa Stok' => $item['stock'],
+                'Harga Modal' => 'Rp ' . number_format($item['cost_price'], 0, ',', '.'),
+                'Harga Jual' => 'Rp ' . number_format($item['selling_price'], 0, ',', '.'),
+                'Total Harga Modal' => 'Rp ' . number_format($item['total_cost_value'], 0, ',', '.'),
+                'Total Harga Jual' => 'Rp ' . number_format($item['total_selling_value'], 0, ',', '.'),
+            ];
+        })->toArray();
+
+        $formatted[] = ['Nama Produk' => ''];
+        $formatted[] = [
+            'Nama Produk' => 'TOTAL',
+            'Sisa Stok' => $stockData->sum('stock'),
+            'Harga Modal' => '',
+            'Harga Jual' => '',
+            'Total Harga Modal' => 'Rp ' . number_format($totals['totalCostValue'], 0, ',', '.'),
+            'Total Harga Jual' => 'Rp ' . number_format($totals['totalSellingValue'], 0, ',', '.'),
+        ];
+
+        return $formatted;
+    }
+}
+EOL
+);
+echo "✓ Created StockReportService.php\n";
+
+// STEP 4: Buat file Helper ExcelExportHelper
+file_put_contents(
+    'app/Helpers/ExcelExportHelper.php',
+    <<<'EOL'
+<?php
+
+namespace App\Helpers;
+
+use OpenSpout\Writer\XLSX\Writer;
+use OpenSpout\Common\Entity\Row;
+use OpenSpout\Common\Entity\Cell;
+
+class ExcelExportHelper
+{
+    public static function generateExcel(array $data, string $fileName): string
+    {
+        $fileName = $fileName . '.xlsx';
+        $path = 'reports/' . $fileName;
+
+        $pathDirectory = storage_path('app/public/reports');
+        if (!file_exists($pathDirectory)) {
+            mkdir($pathDirectory, 0755, true);
+        }
+
+        $writer = new Writer();
+        $fullPath = storage_path('app/public/' . $path);
+        $writer->openToFile($fullPath);
+
+        if (!empty($data)) {
+            $headers = array_keys($data[0]);
+            $headerCells = array_map(fn($header) => new Cell($header), $headers);
+            $writer->addRow(new Row($headerCells));
+
+            foreach ($data as $row) {
+                $cells = array_map(fn($value) => new Cell($value), $row);
+                $writer->addRow(new Row($cells));
+            }
+        }
+
+        $writer->close();
+
+        return $path;
+    }
+}
+EOL
+);
+echo "✓ Created ExcelExportHelper.php\n";
+
+// STEP 5: Buat file Observer StockReportObserver
+file_put_contents(
+    'app/Observers/StockReportObserver.php',
+    <<<'EOL'
+<?php
+
+namespace App\Observers;
+
+use App\Models\StockReport;
+use App\Services\StockReportService;
+use App\Helpers\ExcelExportHelper;
+
+class StockReportObserver
+{
+    protected StockReportService $stockReportService;
+
+    public function __construct(StockReportService $stockReportService)
+    {
+        $this->stockReportService = $stockReportService;
+    }
+
+    public function creating(StockReport $report): void
+    {
+        $today = now()->format('Ymd');
+        $countToday = StockReport::whereDate('created_at', today())->count() + 1;
+        $fileBase = 'STOK-' . $today . '-' . str_pad($countToday, 2, '0', STR_PAD_LEFT);
+
+        $stockData = $this->stockReportService->getStockData();
+        $totals = $this->stockReportService->calculateTotals($stockData);
+        $exportData = $this->stockReportService->formatForExport($stockData, $totals);
+        $path = ExcelExportHelper::generateExcel($exportData, $fileBase);
+
+        $report->name = $fileBase;
+        $report->total_items = $totals['totalItems'];
+        $report->total_cost_value = $totals['totalCostValue'];
+        $report->total_selling_value = $totals['totalSellingValue'];
+        $report->path_file = $path;
+    }
+
+    public function updated(StockReport $report): void
+    {
+        if ($report->getOriginal('path_file')) {
+            $oldPath = storage_path('app/public/' . $report->getOriginal('path_file'));
+            if (file_exists($oldPath)) {
+                unlink($oldPath);
+            }
+        }
+
+        $fileBase = $report->name;
+        $stockData = $this->stockReportService->getStockData();
+        $totals = $this->stockReportService->calculateTotals($stockData);
+        $exportData = $this->stockReportService->formatForExport($stockData, $totals);
+        $path = ExcelExportHelper::generateExcel($exportData, $fileBase);
+
+        $report->total_items = $totals['totalItems'];
+        $report->total_cost_value = $totals['totalCostValue'];
+        $report->total_selling_value = $totals['totalSellingValue'];
+        $report->path_file = $path;
+    }
+
+    public function deleted(StockReport $report): void
+    {
+        if ($report->path_file) {
+            $path = storage_path('app/public/' . $report->path_file);
+            if (file_exists($path)) {
+                unlink($path);
+            }
+        }
+    }
+}
+EOL
+);
+echo "✓ Created StockReportObserver.php\n";
+
+echo "\n✓ All model and service files created!\n";
